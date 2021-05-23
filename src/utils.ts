@@ -14,8 +14,15 @@ import {
   mutationData,
   scrollData,
   inputData,
+  DocumentDimension,
 } from './types';
-import { INode } from 'rrweb-snapshot';
+import {
+  INode,
+  IGNORED_NODE,
+  serializedNodeWithId,
+  NodeType,
+  isShadowRoot,
+} from 'rrweb-snapshot';
 
 export function on(
   type: string,
@@ -27,32 +34,39 @@ export function on(
   return () => target.removeEventListener(type, fn, options);
 }
 
-export const mirror: Mirror = {
-  map: {},
-  getId(n) {
-    // if n is not a serialized INode, use -1 as its id.
-    if (!n.__sn) {
-      return -1;
-    }
-    return n.__sn.id;
-  },
-  getNode(id) {
-    return mirror.map[id] || null;
-  },
-  // TODO: use a weakmap to get rid of manually memory management
-  removeNodeFromMap(n) {
-    const id = n.__sn && n.__sn.id;
-    delete mirror.map[id];
-    if (n.childNodes) {
-      n.childNodes.forEach((child) =>
-        mirror.removeNodeFromMap((child as Node) as INode),
-      );
-    }
-  },
-  has(id) {
-    return mirror.map.hasOwnProperty(id);
-  },
-};
+export function createMirror (): Mirror {
+  return {
+    map: {},
+    getId(n) {
+      // if n is not a serialized INode, use -1 as its id.
+      if (!n.__sn) {
+        return -1;
+      }
+      return n.__sn.id;
+    },
+    getNode(id) {
+      return this.map[id] || null;
+    },
+    // TODO: use a weakmap to get rid of manually memory management
+    removeNodeFromMap(n) {
+      const id = n.__sn && n.__sn.id;
+      delete this.map[id];
+      if (n.childNodes) {
+        n.childNodes.forEach((child) =>
+          this.removeNodeFromMap((child as Node) as INode),
+        );
+      }
+    },
+    has(id) {
+      return this.map.hasOwnProperty(id);
+    },
+    reset() {
+      this.map = {};
+    },
+  };
+}
+
+export const mirror: Mirror = createMirror();
 
 // copy from underscore and modified
 export function throttle<T>(
@@ -197,7 +211,19 @@ export function isBlocked(node: Node | null, blockClass: blockClass): boolean {
   return isBlocked(node.parentNode, blockClass);
 }
 
+export function isIgnored(n: Node | INode): boolean {
+  if ('__sn' in n) {
+    return (n as INode).__sn.id === IGNORED_NODE;
+  }
+  // The main part of the slimDOM check happens in
+  // rrweb-snapshot::serializeNodeWithId
+  return false;
+}
+
 export function isAncestorRemoved(target: INode): boolean {
+  if (isShadowRoot(target)) {
+    return false;
+  }
   const id = mirror.getId(target);
   if (!mirror.has(id)) {
     return true;
@@ -230,6 +256,24 @@ export function polyfill(win = window) {
   if ('DOMTokenList' in win && !win.DOMTokenList.prototype.forEach) {
     win.DOMTokenList.prototype.forEach = (Array.prototype
       .forEach as unknown) as DOMTokenList['forEach'];
+  }
+
+  // https://github.com/Financial-Times/polyfill-service/pull/183
+  if (!Node.prototype.contains) {
+    Node.prototype.contains = function contains(node) {
+      if (!(0 in arguments)) {
+        throw new TypeError('1 argument is required');
+      }
+
+      do {
+        if (this === node) {
+          return true;
+        }
+        // tslint:disable-next-line: no-conditional-assignment
+      } while ((node = node && node.parentNode));
+
+      return false;
+    };
   }
 }
 
@@ -452,4 +496,125 @@ export class TreeIndex {
     this.scrollMap = new Map();
     this.inputMap = new Map();
   }
+}
+
+type ResolveTree = {
+  value: addedNodeMutation;
+  children: ResolveTree[];
+  parent: ResolveTree | null;
+};
+
+export function queueToResolveTrees(queue: addedNodeMutation[]): ResolveTree[] {
+  const queueNodeMap: Record<number, ResolveTree> = {};
+  const putIntoMap = (
+    m: addedNodeMutation,
+    parent: ResolveTree | null,
+  ): ResolveTree => {
+    const nodeInTree: ResolveTree = {
+      value: m,
+      parent,
+      children: [],
+    };
+    queueNodeMap[m.node.id] = nodeInTree;
+    return nodeInTree;
+  };
+
+  const queueNodeTrees: ResolveTree[] = [];
+  for (const mutation of queue) {
+    const { nextId, parentId } = mutation;
+    if (nextId && nextId in queueNodeMap) {
+      const nextInTree = queueNodeMap[nextId];
+      if (nextInTree.parent) {
+        const idx = nextInTree.parent.children.indexOf(nextInTree);
+        nextInTree.parent.children.splice(
+          idx,
+          0,
+          putIntoMap(mutation, nextInTree.parent),
+        );
+      } else {
+        const idx = queueNodeTrees.indexOf(nextInTree);
+        queueNodeTrees.splice(idx, 0, putIntoMap(mutation, null));
+      }
+      continue;
+    }
+    if (parentId in queueNodeMap) {
+      const parentInTree = queueNodeMap[parentId];
+      parentInTree.children.push(putIntoMap(mutation, parentInTree));
+      continue;
+    }
+    queueNodeTrees.push(putIntoMap(mutation, null));
+  }
+
+  return queueNodeTrees;
+}
+
+export function iterateResolveTree(
+  tree: ResolveTree,
+  cb: (mutation: addedNodeMutation) => unknown,
+) {
+  cb(tree.value);
+  /**
+   * The resolve tree was designed to reflect the DOM layout,
+   * but we need append next sibling first, so we do a reverse
+   * loop here.
+   */
+  for (let i = tree.children.length - 1; i >= 0; i--) {
+    iterateResolveTree(tree.children[i], cb);
+  }
+}
+
+type HTMLIFrameINode = HTMLIFrameElement & {
+  __sn: serializedNodeWithId;
+};
+export type AppendedIframe = {
+  mutationInQueue: addedNodeMutation;
+  builtNode: HTMLIFrameINode;
+};
+
+export function isIframeINode(
+  node: INode | ShadowRoot,
+): node is HTMLIFrameINode {
+  if ('__sn' in node) {
+    return (
+      node.__sn.type === NodeType.Element && node.__sn.tagName === 'iframe'
+    );
+  }
+  // node can be document fragment when using the virtual parent feature
+  return false;
+}
+
+export function getBaseDimension(
+  node: Node,
+  rootIframe: Node,
+): DocumentDimension {
+  const frameElement = node.ownerDocument?.defaultView?.frameElement;
+  if (!frameElement || frameElement === rootIframe) {
+    return {
+      x: 0,
+      y: 0,
+      relativeScale: 1,
+      absoluteScale: 1,
+    };
+  }
+
+  const frameDimension = frameElement.getBoundingClientRect();
+  const frameBaseDimension = getBaseDimension(frameElement, rootIframe);
+  // the iframe element may have a scale transform
+  const relativeScale = frameDimension.height / frameElement.clientHeight;
+  return {
+    x:
+      frameDimension.x * frameBaseDimension.relativeScale +
+      frameBaseDimension.x,
+    y:
+      frameDimension.y * frameBaseDimension.relativeScale +
+      frameBaseDimension.y,
+    relativeScale,
+    absoluteScale: frameBaseDimension.absoluteScale * relativeScale,
+  };
+}
+
+export function hasShadowRoot<T extends Node>(
+  n: T,
+): n is T & { shadowRoot: ShadowRoot } {
+  return Boolean(((n as unknown) as Element)?.shadowRoot);
 }
