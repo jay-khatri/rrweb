@@ -950,20 +950,9 @@ export class Replayer {
         const styleSheet: CSSStyleSheet = styleEl.sheet!;
 
         if (d.adds) {
-          d.adds.forEach(({ rule, index }) => {
+          d.adds.forEach(({ rule }) => {
             try {
-              const _index =
-                index === undefined
-                  ? undefined
-                  : Math.min(index, styleSheet.rules.length);
-              try {
-                styleSheet.insertRule(rule, _index);
-              } catch (e) {
-                /**
-                 * sometimes we may capture rules with browser prefix
-                 * insert rule with prefixs in other browsers may cause Error
-                 */
-              }
+              styleEl.textContent = styleEl.textContent?.concat("\n" + rule) ?? null;
             } catch (e) {
               /**
                * accessing styleSheet rules may cause SecurityError
